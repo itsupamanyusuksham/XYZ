@@ -1,0 +1,625 @@
+# This cell creates a minimal Node.js + Express + SQLite project skeleton for the XYZ Institute site.
+# It writes all necessary files into /mnt/data/xyz-institute-site, then zips the folder for download.
+
+import os, json, zipfile, textwrap, pathlib
+
+base = "/mnt/data/xyz-institute-site"
+os.makedirs(base, exist_ok=True)
+
+# Helper to write files
+def write(path, content):
+    full = os.path.join(base, path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(content).lstrip("\n"))
+
+# package.json
+write("package.json", """
+{
+  "name": "xyz-institute-site",
+  "version": "1.0.0",
+  "description": "Website skeleton for XYZ Institute (Express + SQLite + EJS)",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "NODE_ENV=production node server.js",
+    "init-db": "node scripts/init_db.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "connect-sqlite3": "^0.9.0",
+    "dotenv": "^16.4.5",
+    "ejs": "^3.1.10",
+    "express": "^4.19.2",
+    "express-session": "^1.17.3",
+    "multer": "^1.4.5-lts.1",
+    "sqlite3": "^5.1.7"
+  }
+}
+""")
+
+# .env sample
+write(".env.example", """
+PORT=3000
+SESSION_SECRET=supersecretkeychangeit
+DATABASE_URL=./data/app.db
+ACCENT_COLOR=#1E3A8A
+""")
+
+# server.js
+write("server.js", """
+require('dotenv').config();
+const path = require('path');
+const express = require('express');
+const session = require('express-session');
+const SQLiteStore = require('connect-sqlite3')(session);
+
+const { ensureAdmin, ensureAuth } = require('./src/middleware/auth');
+const authRoutes = require('./src/routes/auth');
+const adminRoutes = require('./src/routes/admin');
+const studentRoutes = require('./src/routes/student');
+const pagesRoutes = require('./src/routes/pages');
+
+const app = express();
+
+const PORT = process.env.PORT || 3000;
+const DB_FILE = process.env.DATABASE_URL || path.join(__dirname, 'data', 'app.db');
+
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'src', 'views'));
+
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.urlencoded({ extended: true }));
+
+app.use(session({
+  store: new SQLiteStore({ db: path.basename(DB_FILE), dir: path.dirname(DB_FILE) }),
+  secret: process.env.SESSION_SECRET || 'changeme',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 1000 * 60 * 60 * 8 }
+}));
+
+// Expose user to views
+app.use((req, res, next) => {
+  res.locals.user = req.session.user || null;
+  res.locals.accent = process.env.ACCENT_COLOR || '#1E3A8A';
+  next();
+});
+
+app.use('/', pagesRoutes);
+app.use('/auth', authRoutes);
+app.use('/admin', ensureAdmin, adminRoutes);
+app.use('/student', ensureAuth, studentRoutes);
+
+// 404
+app.use((req, res) => {
+  res.status(404).render('404', { title: 'Not Found' });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
+""")
+
+# db helper
+write("src/db.js", """
+const path = require('path');
+const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
+
+const DB_PATH = process.env.DATABASE_URL || path.join(__dirname, '..', 'data', 'app.db');
+
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+const db = new sqlite3.Database(DB_PATH);
+
+module.exports = db;
+""")
+
+# middleware
+write("src/middleware/auth.js", """
+function ensureAuth(req, res, next) {
+  if (req.session && req.session.user) return next();
+  return res.redirect('/auth/login');
+}
+
+function ensureAdmin(req, res, next) {
+  if (req.session && req.session.user && req.session.user.role === 'admin') return next();
+  return res.redirect('/auth/login');
+}
+
+module.exports = { ensureAuth, ensureAdmin };
+""")
+
+# models - basic SQL helpers
+write("src/models/user.js", """
+const db = require('../db');
+const bcrypt = require('bcrypt');
+
+const SALT_ROUNDS = 10;
+
+// Create user
+function createUser({ name, email, roll_no, semester, department, passwordHash, role='student' }) {
+  return new Promise((resolve, reject) => {
+    const stmt = `INSERT INTO users (name, email, roll_no, semester, department, password_hash, role)
+                  VALUES (?, ?, ?, ?, ?, ?, ?)`;
+    db.run(stmt, [name, email, roll_no, semester, department, passwordHash, role], function (err) {
+      if (err) return reject(err);
+      resolve({ id: this.lastID });
+    });
+  });
+}
+
+function findByEmail(email) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT * FROM users WHERE email = ?', [email], (err, row) => {
+      if (err) return reject(err);
+      resolve(row);
+    });
+  });
+}
+
+function getAllStudents() {
+  return new Promise((resolve, reject) => {
+    db.all('SELECT id, name, email, roll_no, semester, department FROM users WHERE role = "student"', [], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows);
+    });
+  });
+}
+
+module.exports = { createUser, findByEmail, getAllStudents };
+""")
+
+write("src/models/attendance.js", """
+const db = require('../db');
+
+function recordAttendance({ user_id, date, status }) {
+  return new Promise((resolve, reject) => {
+    db.run('INSERT INTO attendance (user_id, date, status) VALUES (?, ?, ?)', [user_id, date, status], function(err){
+      if (err) return reject(err);
+      resolve({ id: this.lastID });
+    });
+  });
+}
+
+function getAttendanceForUser(user_id) {
+  return new Promise((resolve, reject) => {
+    db.all('SELECT date, status FROM attendance WHERE user_id = ? ORDER BY date DESC', [user_id], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows);
+    });
+  });
+}
+
+module.exports = { recordAttendance, getAttendanceForUser };
+""")
+
+write("src/models/timetable.js", """
+const db = require('../db');
+
+function upsertTimetable({ department, semester, data }) {
+  return new Promise((resolve, reject) => {
+    db.run(`INSERT INTO timetables (department, semester, data)
+            VALUES (?, ?, ?)
+            ON CONFLICT(department, semester) DO UPDATE SET data=excluded.data`,
+            [department, semester, JSON.stringify(data)], function(err){
+      if (err) return reject(err);
+      resolve({ changes: this.changes });
+    });
+  });
+}
+
+function getTimetable({ department, semester }) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT data FROM timetables WHERE department = ? AND semester = ?', [department, semester], (err, row) => {
+      if (err) return reject(err);
+      resolve(row ? JSON.parse(row.data) : null);
+    });
+  });
+}
+
+module.exports = { upsertTimetable, getTimetable };
+""")
+
+# routes
+write("src/routes/pages.js", """
+const express = require('express');
+const router = express.Router();
+
+router.get('/', (req, res) => res.render('home', { title: 'Home' }));
+router.get('/about', (req, res) => res.render('about', { title: 'About' }));
+router.get('/people', (req, res) => res.render('people', { title: 'People' }));
+
+module.exports = router;
+""")
+
+write("src/routes/auth.js", """
+const express = require('express');
+const bcrypt = require('bcrypt');
+const { createUser, findByEmail } = require('../models/user');
+const router = express.Router();
+
+router.get('/login', (req, res) => res.render('auth/login', { title: 'Login' }));
+router.get('/register', (req, res) => res.render('auth/register', { title: 'Register' }));
+
+router.post('/register', async (req, res) => {
+  try {
+    const { name, email, roll_no, semester, department, password } = req.body;
+    if (!name || !email || !roll_no || !semester || !department || !password) {
+      return res.render('auth/register', { title: 'Register', error: 'All fields are required.' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    await createUser({ name, email, roll_no, semester, department, passwordHash, role: 'student' });
+    return res.redirect('/auth/login');
+  } catch (e) {
+    return res.render('auth/register', { title: 'Register', error: e.message });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await findByEmail(email);
+    if (!user) return res.render('auth/login', { title: 'Login', error: 'Invalid credentials.' });
+    const ok = await require('bcrypt').compare(password, user.password_hash);
+    if (!ok) return res.render('auth/login', { title: 'Login', error: 'Invalid credentials.' });
+    req.session.user = { id: user.id, name: user.name, role: user.role, department: user.department, semester: user.semester };
+    return res.redirect(user.role === 'admin' ? '/admin' : '/student');
+  } catch (e) {
+    return res.render('auth/login', { title: 'Login', error: e.message });
+  }
+});
+
+router.post('/logout', (req, res) => {
+  req.session.destroy(() => res.redirect('/'));
+});
+
+module.exports = router;
+""")
+
+write("src/routes/admin.js", """
+const express = require('express');
+const { getAllStudents } = require('../models/user');
+const { upsertTimetable } = require('../models/timetable');
+const router = express.Router();
+
+router.get('/', async (req, res) => {
+  const students = await getAllStudents();
+  res.render('admin/dashboard', { title: 'Admin Dashboard', students });
+});
+
+router.post('/timetable', async (req, res) => {
+  const { department, semester, data } = req.body; // data as JSON string from a textarea
+  try {
+    const parsed = JSON.parse(data || '{}');
+    await upsertTimetable({ department, semester, data: parsed });
+    res.redirect('/admin');
+  } catch (e) {
+    res.render('admin/dashboard', { title: 'Admin Dashboard', students: await getAllStudents(), error: 'Invalid timetable JSON.' });
+  }
+});
+
+module.exports = router;
+""")
+
+write("src/routes/student.js", """
+const express = require('express');
+const { getAttendanceForUser } = require('../models/attendance');
+const { getTimetable } = require('../models/timetable');
+const router = express.Router();
+
+router.get('/', async (req, res) => {
+  const user = req.session.user;
+  const attendance = await getAttendanceForUser(user.id);
+  const timetable = await getTimetable({ department: user.department, semester: user.semester }) || [];
+  res.render('student/dashboard', { title: 'Student Dashboard', attendance, timetable });
+});
+
+module.exports = router;
+""")
+
+# init db script
+write("scripts/init_db.js", """
+require('dotenv').config();
+const path = require('path');
+const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcrypt');
+
+const DB_FILE = process.env.DATABASE_URL || path.join(__dirname, '..', 'data', 'app.db');
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+
+const db = new sqlite3.Database(DB_FILE);
+
+db.serialize(async () => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    roll_no TEXT,
+    semester TEXT,
+    department TEXT,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'student'
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS attendance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    status TEXT CHECK(status IN ('Present','Absent')) NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS timetables (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    department TEXT NOT NULL,
+    semester TEXT NOT NULL,
+    data TEXT NOT NULL,
+    UNIQUE(department, semester)
+  )`);
+
+  // Seed an admin user
+  const adminPass = await bcrypt.hash('admin123', 10);
+  db.run(`INSERT OR IGNORE INTO users (name, email, roll_no, semester, department, password_hash, role)
+          VALUES ('Admin', 'admin@xyz.edu', 'ADMIN', 'N/A', 'N/A', ?, 'admin')`, [adminPass], (err) => {
+    if (err) console.error(err);
+    else console.log('Admin user ensured: admin@xyz.edu / admin123');
+  });
+});
+
+db.close();
+""")
+
+# views - layout and pages
+write("src/views/partials/head.ejs", """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> • XYZ Institute</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <a href="/" class="brand">XYZ Institute</a>
+    <nav>
+      <a href="/">Home</a>
+      <a href="/about">About</a>
+      <a href="/people">People</a>
+      <a href="/auth/login">Profile</a>
+      <% if (user) { %>
+        <form action="/auth/logout" method="post" style="display:inline;">
+          <button class="linklike" type="submit">Logout</button>
+        </form>
+      <% } %>
+    </nav>
+  </div>
+</header>
+<main class="container">
+""")
+
+write("src/views/partials/foot.ejs", """
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <small>© <%= new Date().getFullYear() %> XYZ Institute</small>
+  </div>
+</footer>
+</body>
+</html>
+""")
+
+write("src/views/home.ejs", """
+<%- include('partials/head', { title }) %>
+<section class="hero">
+  <h1>Welcome to XYZ Institute</h1>
+  <p>Where learning meets excellence. Explore our programs, people, and student services.</p>
+  <div class="cta">
+    <a class="btn" href="/about">Learn More</a>
+    <a class="btn outline" href="/auth/login">Go to Profile</a>
+  </div>
+</section>
+<%- include('partials/foot') %>
+""")
+
+write("src/views/about.ejs", """
+<%- include('partials/head', { title }) %>
+<h2>About Us</h2>
+<p>XYZ Institute is committed to delivering quality education with a focus on innovation and community impact.</p>
+<ul>
+  <li>Mission: Empower students through knowledge.</li>
+  <li>Vision: Build a brighter future with technology.</li>
+</ul>
+<%- include('partials/foot') %>
+""")
+
+write("src/views/people.ejs", """
+<%- include('partials/head', { title }) %>
+<h2>Our People</h2>
+<ul class="card-list">
+  <li class="card">
+    <h3>Dr. A. Sharma</h3>
+    <p>Principal</p>
+  </li>
+  <li class="card">
+    <h3>Prof. R. Das</h3>
+    <p>Head, Computer Science</p>
+  </li>
+</ul>
+<%- include('partials/foot') %>
+""")
+
+write("src/views/404.ejs", """
+<%- include('partials/head', { title }) %>
+<h2>Page Not Found</h2>
+<p>The page you are looking for does not exist.</p>
+<%- include('partials/foot') %>
+""")
+
+# auth views
+write("src/views/auth/login.ejs", """
+<%- include('../partials/head', { title }) %>
+<h2>Login</h2>
+<% if (typeof error !== 'undefined') { %><div class="alert"><%= error %></div><% } %>
+<form method="post" action="/auth/login" class="form">
+  <label>Email <input type="email" name="email" required></label>
+  <label>Password <input type="password" name="password" required></label>
+  <button class="btn" type="submit">Login</button>
+</form>
+<p>New student? <a href="/auth/register">Create your account</a></p>
+<%- include('../partials/foot') %>
+""")
+
+write("src/views/auth/register.ejs", """
+<%- include('../partials/head', { title }) %>
+<h2>Student Registration</h2>
+<% if (typeof error !== 'undefined') { %><div class="alert"><%= error %></div><% } %>
+<form method="post" action="/auth/register" class="form">
+  <div class="grid">
+    <label>Name <input type="text" name="name" required></label>
+    <label>Email <input type="email" name="email" required></label>
+    <label>Roll No. <input type="text" name="roll_no" required></label>
+    <label>Semester <input type="text" name="semester" required></label>
+    <label>Department <input type="text" name="department" required></label>
+  </div>
+  <label>Password <input type="password" name="password" required></label>
+  <button class="btn" type="submit">Create Account</button>
+</form>
+<%- include('../partials/foot') %>
+""")
+
+# admin views
+write("src/views/admin/dashboard.ejs", """
+<%- include('../partials/head', { title }) %>
+<h2>Admin Dashboard</h2>
+<% if (typeof error !== 'undefined') { %><div class="alert"><%= error %></div><% } %>
+<section>
+  <h3>Student Accounts</h3>
+  <table class="table">
+    <thead><tr><th>Name</th><th>Email</th><th>Roll</th><th>Semester</th><th>Department</th></tr></thead>
+    <tbody>
+      <% students.forEach(s => { %>
+        <tr>
+          <td><%= s.name %></td>
+          <td><%= s.email %></td>
+          <td><%= s.roll_no %></td>
+          <td><%= s.semester %></td>
+          <td><%= s.department %></td>
+        </tr>
+      <% }) %>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h3>Upload / Update Timetable</h3>
+  <form method="post" action="/admin/timetable" class="form">
+    <div class="grid">
+      <label>Department <input type="text" name="department" required></label>
+      <label>Semester <input type="text" name="semester" required></label>
+    </div>
+    <label>Timetable JSON
+      <textarea name="data" rows="6" placeholder='[{"day":"Mon","9:00":"Math","11:00":"Physics"}]' required></textarea>
+    </label>
+    <button class="btn" type="submit">Save Timetable</button>
+  </form>
+</section>
+<%- include('../partials/foot') %>
+""")
+
+# student view
+write("src/views/student/dashboard.ejs", """
+<%- include('../partials/head', { title }) %>
+<h2>Hello, <%= user.name %></h2>
+<section>
+  <h3>Your Timetable (Dept: <%= user.department %>, Sem: <%= user.semester %>)</h3>
+  <% if (!timetable || timetable.length === 0) { %>
+    <p>No timetable uploaded yet.</p>
+  <% } else { %>
+    <table class="table">
+      <thead>
+        <tr>
+          <% Object.keys(timetable[0]).forEach(k => { %><th><%= k %></th><% }) %>
+        </tr>
+      </thead>
+      <tbody>
+        <% timetable.forEach(row => { %>
+          <tr>
+            <% Object.values(row).forEach(v => { %><td><%= v %></td><% }) %>
+          </tr>
+        <% }) %>
+      </tbody>
+    </table>
+  <% } %>
+</section>
+
+<section>
+  <h3>Attendance</h3>
+  <% if (!attendance || attendance.length === 0) { %>
+    <p>No attendance records yet.</p>
+  <% } else { %>
+    <ul>
+      <% attendance.forEach(a => { %>
+        <li><strong><%= a.date %>:</strong> <%= a.status %></li>
+      <% }) %>
+    </ul>
+  <% } %>
+</section>
+<%- include('../partials/foot') %>
+""")
+
+# CSS
+write("public/css/style.css", """
+:root {
+  --accent: <%= accent %>;
+}
+
+* { box-sizing: border-box; }
+body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color:#111; background:#fff; }
+.container { max-width: 1000px; margin: 0 auto; padding: 1rem; }
+.site-header { border-bottom: 1px solid #eee; background: #fafafa; }
+.site-header .brand { font-weight: 700; text-decoration: none; color: #111; }
+.site-header nav a, .site-header .linklike { margin-left: 1rem; text-decoration: none; color: #111; }
+.site-footer { border-top: 1px solid #eee; padding: 1rem 0; background: #fafafa; margin-top: 2rem; }
+.hero { padding: 2rem 0; }
+.btn { background: var(--accent); color:#fff; border: none; padding: .6rem 1rem; border-radius: .5rem; cursor: pointer; text-decoration: none; display: inline-block; }
+.btn.outline { background: transparent; border: 2px solid var(--accent); color: var(--accent); }
+.form { display: grid; gap: .75rem; max-width: 600px; }
+.form .grid { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+.form label { display: grid; gap: .35rem; font-size: .95rem; }
+.form input, .form textarea { padding: .55rem .6rem; border: 1px solid #ddd; border-radius: .4rem; }
+.alert { background: #fff7ed; border: 1px solid #fed7aa; padding: .5rem .75rem; border-radius: .4rem; margin-bottom: .75rem; }
+.table { width: 100%; border-collapse: collapse; }
+.table th, .table td { border: 1px solid #eee; padding: .5rem; text-align: left; }
+.card-list { display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap: 1rem; padding: 0; list-style: none; }
+.card { border:1px solid #eee; border-radius: .75rem; padding: 1rem; background:#fff; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
+.linklike { background:none; border:none; padding:0; cursor:pointer; font: inherit; color:#111; }
+@media (max-width: 640px) {
+  .form .grid { grid-template-columns: 1fr; }
+}
+""")
+
+# README
+write("README.md", """
+# XYZ Institute – Website Skeleton
+
+A clean, efficient starter using **Node.js + Express + SQLite + EJS**.
+
+## Features
+- Front pages: Home, About, People
+- Auth: Student register/login; Admin login
+- Student dashboard: timetable + attendance (read-only)
+- Admin dashboard: view student accounts, upload/update timetable JSON
+- Simple, light theme with one accent color
+
+## Quick Start
+```bash
+cd xyz-institute-site
+cp .env.example .env
+npm install
+npm run init-db
+npm run dev
